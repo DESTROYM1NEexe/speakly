@@ -107,12 +107,195 @@ dp = Dispatcher(storage=storage)
 class UserState(StatesGroup):
     choosing_action = State()
     choosing_level = State()
+    onboarding_level = State()
+    onboarding_goal = State()
+    onboarding_dialect = State()
+    onboarding_pace = State()
     waiting_for_url = State()
     choosing_vocabulary_page = State()
     practicing_word = State()
     waiting_for_reminder_time = State()
     waiting_for_timezone = State()
     ai_teacher_chat = State()
+
+
+# ============================================================
+# Onboarding / Profile Setup
+# ============================================================
+
+ONBOARDING_LEVELS = ("A1", "A2", "B1", "B2", "C1", "C2")
+ONBOARDING_GOALS = {
+    "Speaking": "Speaking",
+    "IELTS": "IELTS",
+    "General English": "General English",
+    "Business English": "Business English",
+}
+ONBOARDING_DIALECTS = {
+    "🇺🇸 American English": "American",
+    "🇬🇧 British English": "British",
+}
+ONBOARDING_PACES = {
+    "Relaxed": (10, 5),
+    "Regular": (20, 10),
+    "Intensive": (20, 10),
+}
+
+
+def init_onboarding_storage() -> None:
+    """Add persistent onboarding state without requiring database.py changes."""
+    conn = sqlite3.connect(config.DB_PATH)
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS bot_migrations "
+            "(name TEXT PRIMARY KEY, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+        if "onboarding_completed" not in columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN onboarding_completed INTEGER NOT NULL DEFAULT 0"
+            )
+
+        marker = conn.execute(
+            "SELECT 1 FROM bot_migrations WHERE name = ?",
+            ("onboarding_v1",),
+        ).fetchone()
+        if not marker:
+            # Existing accounts keep their current profiles and skip the new onboarding.
+            conn.execute(
+                "UPDATE users SET onboarding_completed = 1 "
+                "WHERE onboarding_completed = 0"
+            )
+            conn.execute(
+                "INSERT INTO bot_migrations (name) VALUES (?)",
+                ("onboarding_v1",),
+            )
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS onboarding_profiles ("
+            "telegram_id INTEGER PRIMARY KEY, "
+            "pace TEXT NOT NULL DEFAULT 'Regular', "
+            "completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+            "FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)"
+            ")"
+        )
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        logger.exception("Could not initialize onboarding storage")
+        raise
+    finally:
+        conn.close()
+
+
+def is_onboarding_completed(telegram_id: int) -> bool:
+    conn = sqlite3.connect(config.DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT onboarding_completed FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+        return bool(row and row[0])
+    finally:
+        conn.close()
+
+
+def complete_onboarding(telegram_id: int, pace: str) -> bool:
+    conn = sqlite3.connect(config.DB_PATH)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            "UPDATE users SET onboarding_completed = 1, last_active = CURRENT_TIMESTAMP "
+            "WHERE telegram_id = ?",
+            (telegram_id,),
+        )
+        if cursor.rowcount != 1:
+            conn.rollback()
+            return False
+        conn.execute(
+            "INSERT INTO onboarding_profiles (telegram_id, pace) VALUES (?, ?) "
+            "ON CONFLICT(telegram_id) DO UPDATE SET pace = excluded.pace, "
+            "completed_at = CURRENT_TIMESTAMP",
+            (telegram_id, pace),
+        )
+        conn.commit()
+        return True
+    except sqlite3.Error:
+        conn.rollback()
+        logger.exception("Could not complete onboarding")
+        return False
+    finally:
+        conn.close()
+
+
+def get_onboarding_pace(telegram_id: int) -> str:
+    conn = sqlite3.connect(config.DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT pace FROM onboarding_profiles WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+        return row[0] if row else "Regular"
+    finally:
+        conn.close()
+
+
+def get_onboarding_level_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="A1"), types.KeyboardButton(text="A2")],
+            [types.KeyboardButton(text="B1"), types.KeyboardButton(text="B2")],
+            [types.KeyboardButton(text="C1"), types.KeyboardButton(text="C2")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def get_onboarding_goal_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="🗣 Speaking"), types.KeyboardButton(text="🎯 IELTS")],
+            [types.KeyboardButton(text="📚 General English")],
+            [types.KeyboardButton(text="💼 Business English")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def get_onboarding_dialect_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="🇺🇸 American English")],
+            [types.KeyboardButton(text="🇬🇧 British English")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def get_onboarding_pace_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="🌱 Relaxed")],
+            [types.KeyboardButton(text="⚡ Regular")],
+            [types.KeyboardButton(text="🔥 Intensive")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+async def start_onboarding(message: types.Message, state: FSMContext) -> None:
+    first_name = html.escape(message.from_user.first_name or "there") if message.from_user else "there"
+    await message.answer(
+        f"<b>Welcome to Speakly, {first_name}! 👋</b>\n\n"
+        "Let's personalize your English learning experience.\n\n"
+        "It will only take a few seconds.",
+        parse_mode="HTML",
+        reply_markup=get_onboarding_level_keyboard(),
+    )
+    await state.set_state(UserState.onboarding_level)
 
 
 # ============================================================
@@ -885,16 +1068,17 @@ async def start_command(
         return
 
     telegram_id = message.from_user.id
+    user = get_or_create_user(telegram_id)
 
-    user = get_or_create_user(
-        telegram_id
-    )
+    if not is_onboarding_completed(telegram_id):
+        await start_onboarding(message, state)
+        return
 
     first_name = html.escape(message.from_user.first_name or "there")
     welcome_text = f"""
-    <b>Your English Studio</b>
+<b>Your English Studio</b>
 
-Welcome, {first_name}.
+Welcome back, {first_name}.
 
 Short, personal practice that builds over time.
 
@@ -919,9 +1103,96 @@ Choose a session below.
             reply_markup=get_main_menu_keyboard(),
         )
 
-    await state.set_state(
-        UserState.choosing_action
+    await state.set_state(UserState.choosing_action)
+
+
+@dp.message(UserState.onboarding_level, F.text.in_(ONBOARDING_LEVELS))
+async def onboarding_level_handler(message: types.Message, state: FSMContext):
+    if message.from_user is None or message.text is None:
+        return
+
+    update_user_level(message.from_user.id, message.text)
+    await state.update_data(onboarding_level=message.text)
+    await message.answer(
+        "<b>What's your main goal? 🎯</b>\n\n"
+        "Choose what you want Speakly to focus on most.",
+        parse_mode="HTML",
+        reply_markup=get_onboarding_goal_keyboard(),
     )
+    await state.set_state(UserState.onboarding_goal)
+
+
+@dp.message(UserState.onboarding_goal, F.text.in_(list(ONBOARDING_GOALS.keys())))
+async def onboarding_goal_handler(message: types.Message, state: FSMContext):
+    if message.from_user is None or message.text is None:
+        return
+
+    goal = ONBOARDING_GOALS[message.text]
+    update_user_settings(message.from_user.id, learning_goal=goal)
+    await state.update_data(onboarding_goal=goal)
+    await message.answer(
+        "<b>Which English do you want to learn? 🇺🇸</b>\n\n"
+        "This changes vocabulary, examples, expressions and pronunciation focus.",
+        parse_mode="HTML",
+        reply_markup=get_onboarding_dialect_keyboard(),
+    )
+    await state.set_state(UserState.onboarding_dialect)
+
+
+@dp.message(UserState.onboarding_dialect, F.text.in_(list(ONBOARDING_DIALECTS.keys())))
+async def onboarding_dialect_handler(message: types.Message, state: FSMContext):
+    if message.from_user is None or message.text is None:
+        return
+
+    dialect = ONBOARDING_DIALECTS[message.text]
+    update_user_settings(message.from_user.id, dialect=dialect)
+    await state.update_data(onboarding_dialect=dialect)
+    await message.answer(
+        "<b>How intense should your learning be? 🔥</b>\n\n"
+        "Choose the pace that feels right for you.",
+        parse_mode="HTML",
+        reply_markup=get_onboarding_pace_keyboard(),
+    )
+    await state.set_state(UserState.onboarding_pace)
+
+
+@dp.message(UserState.onboarding_pace, F.text.in_(list(ONBOARDING_PACES.keys())))
+async def onboarding_pace_handler(message: types.Message, state: FSMContext):
+    if message.from_user is None or message.text is None:
+        return
+
+    pace = message.text
+    pace_name = pace.split(" ", 1)[1]
+    review_target, new_word_target = ONBOARDING_PACES[pace]
+    telegram_id = message.from_user.id
+
+    update_user_settings(
+        telegram_id,
+        daily_review_target=review_target,
+        daily_new_word_target=new_word_target,
+    )
+
+    data = await state.get_data()
+    level = data.get("onboarding_level", get_or_create_user(telegram_id)["level"])
+    goal = data.get("onboarding_goal", get_or_create_user(telegram_id)["learning_goal"])
+    dialect = data.get("onboarding_dialect", get_or_create_user(telegram_id)["dialect"])
+
+    if not complete_onboarding(telegram_id, pace_name):
+        await message.answer("Something went wrong while saving your profile. Please send /start and try again.")
+        await state.clear()
+        return
+
+    await message.answer(
+        "<b>🎉 Your Speakly profile is ready!</b>\n\n"
+        f"📈 <b>Level:</b> {html.escape(str(level))}\n"
+        f"🎯 <b>Goal:</b> {html.escape(str(goal))}\n"
+        f"🌎 <b>English:</b> {html.escape(str(dialect))}\n"
+        f"🔥 <b>Pace:</b> {html.escape(pace_name)}\n\n"
+        "Your lessons will now adapt to your preferences.",
+        parse_mode="HTML",
+        reply_markup=get_main_menu_keyboard(),
+    )
+    await state.set_state(UserState.choosing_action)
 
 
 @dp.message(Command("help"))
@@ -3289,6 +3560,7 @@ async def main():
     )
 
     init_database()
+    init_onboarding_storage()
 
     logger.info(
         "Starting bot..."
