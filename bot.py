@@ -1,6 +1,6 @@
-
 import asyncio
 import html
+import inspect
 import sqlite3
 import json
 import re
@@ -298,8 +298,188 @@ async def start_onboarding(message: types.Message, state: FSMContext) -> None:
 
 
 # ============================================================
-# AI Analysis
+# Premium monthly subscription (Telegram Stars)
 # ============================================================
+
+SUBSCRIPTION_PERIOD_SECONDS = 2592000  # 30 days (allowed: 2592000 / 5184000 / 7776000)
+SUBSCRIPTION_PERIOD_DAYS = SUBSCRIPTION_PERIOD_SECONDS // 86400
+PREMIUM_EXPIRY_GRACE = timedelta(hours=12)  # buffer for Telegram renewal delays
+
+
+def subscriptions_supported() -> bool:
+    """True when installed aiogram supports Stars subscriptions (>= 3.15, Bot API 8.0)."""
+    try:
+        return "subscription_period" in inspect.signature(bot.send_invoice).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _parse_utc(value: Any) -> Optional[datetime]:
+    """Parse a stored timestamp as UTC-aware datetime; None on bad data."""
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def init_premium_storage() -> None:
+    """Monthly Premium subscription storage without touching database.py."""
+    conn = sqlite3.connect(config.DB_PATH)
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS premium_subscriptions ("
+            "telegram_id INTEGER PRIMARY KEY, "
+            "expires_at TEXT NOT NULL, "
+            "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS premium_subscription_charges ("
+            "telegram_charge_id TEXT PRIMARY KEY, "
+            "telegram_id INTEGER NOT NULL, "
+            "charged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        logger.exception("Could not initialize premium subscription storage")
+        raise
+    finally:
+        conn.close()
+
+
+def get_premium_expires_at(telegram_id: int) -> Optional[datetime]:
+    conn = sqlite3.connect(config.DB_PATH)
+    try:
+        row = conn.execute(
+            "SELECT expires_at FROM premium_subscriptions WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+        if not row:
+            return None
+        expires = _parse_utc(row[0])
+        if expires is None:
+            logger.error("Invalid premium expiry %r for user %s", row[0], telegram_id)
+        return expires
+    except sqlite3.Error:
+        logger.exception("Could not read premium subscription for user %s", telegram_id)
+        return None
+    finally:
+        conn.close()
+
+
+def extend_premium_subscription(
+    telegram_id: int,
+    telegram_charge_id: str,
+    days: int = SUBSCRIPTION_PERIOD_DAYS,
+) -> Tuple[str, Optional[datetime]]:
+    """Apply one paid charge to the subscription window.
+
+    Returns ("extended", new_expiry) / ("duplicate", current_expiry) / ("error", None).
+    """
+    now_utc = datetime.now(timezone.utc)
+    conn = sqlite3.connect(config.DB_PATH)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        current: Optional[datetime] = None
+        row = conn.execute(
+            "SELECT expires_at FROM premium_subscriptions WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+        if row:
+            current = _parse_utc(row[0])
+
+        try:
+            conn.execute(
+                "INSERT INTO premium_subscription_charges (telegram_charge_id, telegram_id) "
+                "VALUES (?, ?)",
+                (telegram_charge_id, telegram_id),
+            )
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            return "duplicate", current
+
+        base = current if (current and current > now_utc) else now_utc
+        new_expires = base + timedelta(days=days)
+
+        conn.execute(
+            "INSERT INTO premium_subscriptions (telegram_id, expires_at) VALUES (?, ?) "
+            "ON CONFLICT(telegram_id) DO UPDATE SET "
+            "expires_at = excluded.expires_at, updated_at = CURRENT_TIMESTAMP",
+            (telegram_id, new_expires.isoformat()),
+        )
+        conn.execute(
+            "UPDATE users SET is_premium = 1 WHERE telegram_id = ?",
+            (telegram_id,),
+        )
+        conn.commit()
+        return "extended", new_expires
+    except sqlite3.Error:
+        conn.rollback()
+        logger.exception("Could not extend premium subscription for user %s", telegram_id)
+        return "error", None
+    finally:
+        conn.close()
+
+
+def revoke_premium_subscription(telegram_id: int) -> bool:
+    """End Premium immediately (used for refunds)."""
+    conn = sqlite3.connect(config.DB_PATH)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "DELETE FROM premium_subscriptions WHERE telegram_id = ?", (telegram_id,)
+        )
+        conn.execute(
+            "UPDATE users SET is_premium = 0 WHERE telegram_id = ?", (telegram_id,)
+        )
+        conn.commit()
+        return True
+    except sqlite3.Error:
+        conn.rollback()
+        logger.exception("Could not revoke premium subscription for user %s", telegram_id)
+        return False
+    finally:
+        conn.close()
+
+
+def expire_premium_subscriptions() -> List[int]:
+    """Turn off Premium for users whose paid month has ended. Returns their ids."""
+    cutoff = datetime.now(timezone.utc) - PREMIUM_EXPIRY_GRACE
+    expired_users: List[int] = []
+    conn = sqlite3.connect(config.DB_PATH)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            "SELECT telegram_id, expires_at FROM premium_subscriptions"
+        ).fetchall()
+        for telegram_id, expires_raw in rows:
+            expires = _parse_utc(expires_raw)
+            if expires is None:
+                logger.error("Invalid premium expiry %r for user %s", expires_raw, telegram_id)
+                continue
+            if expires > cutoff:
+                continue
+            conn.execute(
+                "UPDATE users SET is_premium = 0 WHERE telegram_id = ? AND is_premium = 1",
+                (telegram_id,),
+            )
+            conn.execute(
+                "DELETE FROM premium_subscriptions WHERE telegram_id = ?",
+                (telegram_id,),
+            )
+            expired_users.append(int(telegram_id))
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        logger.exception("Premium expiry sweep failed")
+    finally:
+        conn.close()
+    return expired_users
+
 
 # ============================================================
 # Formatting
@@ -944,7 +1124,7 @@ def get_premium_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(
-                text=f"⭐ Buy Premium · {config.PREMIUM_PRICE_STARS} Stars",
+                text=f"⭐ Subscribe · {config.PREMIUM_PRICE_STARS} Stars / month",
                 callback_data="premium_buy",
             )]
         ]
@@ -1900,6 +2080,7 @@ async def history_callback(callback: types.CallbackQuery):
     )
     await callback.answer()
 
+
 @dp.message(F.text == "📊 Progress")
 async def progress_handler(
     message: types.Message
@@ -2068,7 +2249,8 @@ Reviews    {stats["reviews_today"]}/{reviews_target}  <code>{reviews_bar}</code>
         progress_text,
         parse_mode="HTML"
     )
-    
+
+
 @dp.message(F.text == "🔥 Streak")
 async def streak_handler(message: types.Message):
     if message.from_user is None:
@@ -2087,6 +2269,10 @@ async def streak_handler(message: types.Message):
     )
 
 
+# ============================================================
+# Premium (monthly subscription)
+# ============================================================
+
 @dp.message(F.text == "⭐ Premium")
 async def premium_handler(message: types.Message):
     if message.from_user is None:
@@ -2100,15 +2286,38 @@ async def premium_handler(message: types.Message):
         )
         return
     if user["is_premium"]:
-        text = "⭐ <b>Premium active</b>\n\nYour account has Premium access."
+        expires_at = get_premium_expires_at(telegram_id)
+        if expires_at:
+            expires_local = expires_at.astimezone(get_user_timezone(telegram_id))
+            days_left = max(0, (expires_at - datetime.now(timezone.utc)).days)
+            renewal_note = (
+                "The subscription renews automatically every 30 days.\n"
+                "Cancel anytime in Telegram: Settings → ⭐ Stars."
+                if subscriptions_supported() else
+                "Access lasts 30 days. Renew via ⭐ Premium in the main menu."
+            )
+            text = (
+                "⭐ <b>Premium active</b>\n\n"
+                f"Valid until: {expires_local:%d %b %Y, %H:%M} ({days_left} day(s) left).\n\n"
+                f"{renewal_note}"
+            )
+        else:
+            text = "⭐ <b>Premium active</b>\n\nYour account has Premium access."
         keyboard = None
     else:
+        price_note = (
+            f"Subscription: <b>{config.PREMIUM_PRICE_STARS} Stars / month</b>.\n"
+            "Renews automatically every 30 days. Cancel anytime in Telegram Settings."
+            if subscriptions_supported() else
+            f"Price: <b>{config.PREMIUM_PRICE_STARS} Stars for 30 days</b>.\n"
+            "Renew via ⭐ Premium in the main menu when the month ends."
+        )
         text = (
             "⭐ <b>Premium</b>\n\n"
             f"Free plan: {config.FREE_DAILY_LIMIT} videos/day, "
             f"{config.FREE_DAILY_NEW_WORD_LIMIT} new words/day, and "
             f"{config.FREE_DAILY_AI_TEACHER_LIMIT} AI Teacher requests/day.\n\n"
-            f"Upgrade once for {config.PREMIUM_PRICE_STARS} Telegram Stars to unlock Premium."
+            f"{price_note}"
         )
         keyboard = get_premium_keyboard()
     await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
@@ -2134,18 +2343,30 @@ async def premium_buy_callback(callback: types.CallbackQuery):
         await callback.answer("Unable to start checkout here.", show_alert=True)
         return
 
+    # subscription_period exists only in aiogram >= 3.15 (Bot API 8.0)
+    invoice_kwargs: Dict[str, Any] = {}
+    if subscriptions_supported():
+        description = (
+            "Monthly Premium subscription. Renews automatically every 30 days. "
+            "Cancel anytime in Telegram Settings."
+        )
+        invoice_kwargs["subscription_period"] = SUBSCRIPTION_PERIOD_SECONDS
+    else:
+        description = "Premium access for 30 days. Renew via ⭐ Premium when it ends."
+
     try:
         await bot.send_invoice(
             chat_id=message.chat.id,
             title="English Learning Bot Premium",
-            description="One-time Premium upgrade for your English learning account.",
+            description=description,
             payload=create_premium_payload(telegram_id),
             provider_token="",
             currency="XTR",
             prices=[LabeledPrice(
-                label="Premium access",
+                label="Premium · 1 month",
                 amount=config.PREMIUM_PRICE_STARS,
             )],
+            **invoice_kwargs,
         )
     except Exception:
         logger.exception("Could not create Telegram Stars Premium invoice")
@@ -2178,65 +2399,90 @@ async def premium_successful_payment(message: types.Message):
         return
 
     payment = message.successful_payment
+    telegram_id = message.from_user.id
+
+    # Keep the payment ledger from database.py (dedup, history).
     try:
         result = record_premium_payment(
-            telegram_id=message.from_user.id,
+            telegram_id=telegram_id,
             payload=payment.invoice_payload,
             currency=payment.currency,
             total_amount=payment.total_amount,
             telegram_charge_id=payment.telegram_payment_charge_id,
             provider_charge_id=payment.provider_payment_charge_id,
         )
-        if result == "activated":
-            await message.answer(
-                "⭐ <b>Premium activated!</b> Your account now has Premium access.",
-                parse_mode="HTML",
-                reply_markup=get_main_menu_keyboard(),
-            )
-        elif result == "duplicate":
-            await message.answer("This payment was already processed. Premium access remains active.")
-        else:
-            logger.error(
-                "Could not activate Premium after payment from user %s (result=%s)",
-                message.from_user.id,
-                result,
-            )
-            await message.answer(
-                "We couldn't verify this payment automatically. Please contact the bot owner with your Telegram payment receipt."
-            )
-    except Exception as e:
-        logger.exception("Error processing premium payment: %s", e)
-        await message.answer(
-            "An error occurred while processing your payment. Please contact support."
-        )
+    except Exception:
+        logger.exception("Error recording premium payment for user %s", telegram_id)
+        result = "error"
 
-    payment = message.successful_payment
-    result = record_premium_payment(
-        telegram_id=message.from_user.id,
-        payload=payment.invoice_payload,
-        currency=payment.currency,
-        total_amount=payment.total_amount,
-        telegram_charge_id=payment.telegram_payment_charge_id,
-        provider_charge_id=payment.provider_payment_charge_id,
+    # Extend the subscription window by 30 days. Dedup here is based on the
+    # unique telegram_charge_id, so recurring subscription charges extend fine
+    # even when the ledger above treats the payload as a duplicate.
+    status, expires_at = extend_premium_subscription(
+        telegram_id,
+        payment.telegram_payment_charge_id,
+        SUBSCRIPTION_PERIOD_DAYS,
     )
-    if result == "activated":
-        await message.answer(
-            "⭐ <b>Premium activated!</b> Your account now has Premium access.",
-            parse_mode="HTML",
-            reply_markup=get_main_menu_keyboard(),
-        )
-    elif result == "duplicate":
+
+    if status == "extended" and expires_at is not None:
+        expires_local = expires_at.astimezone(get_user_timezone(telegram_id))
+        if subscriptions_supported():
+            is_renewal = getattr(payment, "is_first_recurring", True) is False
+            if is_renewal:
+                text = (
+                    "⭐ <b>Premium renewed!</b>\n\n"
+                    f"Active until {expires_local:%d %b %Y, %H:%M} (your time)."
+                )
+            else:
+                text = (
+                    "⭐ <b>Premium activated!</b>\n\n"
+                    f"Price: {config.PREMIUM_PRICE_STARS} Stars / month.\n"
+                    f"Next charge: {expires_local:%d %b %Y}.\n\n"
+                    "Cancel anytime: Telegram Settings → ⭐ Stars."
+                )
+        else:
+            text = (
+                "⭐ <b>Premium activated!</b>\n\n"
+                f"Active until {expires_local:%d %b %Y, %H:%M} (your time).\n"
+                "Renew via ⭐ Premium when the month ends."
+            )
+        await message.answer(text, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
+    elif status == "duplicate":
         await message.answer("This payment was already processed. Premium access remains active.")
     else:
         logger.error(
-            "Could not activate Premium after payment from user %s (result=%s)",
-            message.from_user.id,
+            "Could not activate monthly Premium for user %s (payment_result=%s)",
+            telegram_id,
             result,
         )
         await message.answer(
             "We couldn't verify this payment automatically. Please contact the bot owner with your Telegram payment receipt."
         )
 
+
+# Message.refunded_payment requires aiogram >= 3.13 (Bot API 7.10).
+# On older versions refunds are handled by the expiry loop instead.
+if hasattr(types.Message, "refunded_payment"):
+    @dp.message(F.refunded_payment)
+    async def premium_refunded_payment(message: types.Message):
+        """Refunded Stars payment cancels the subscription immediately."""
+        if message.from_user is None:
+            return
+        refunded = getattr(message, "refunded_payment", None)
+        if refunded is None:
+            return
+        if not revoke_premium_subscription(message.from_user.id):
+            logger.error("Could not revoke premium after refund for user %s", message.from_user.id)
+            return
+        await message.answer(
+            "⭐ Your Premium subscription was refunded and deactivated.",
+            reply_markup=get_main_menu_keyboard(),
+        )
+
+
+# ============================================================
+# Settings
+# ============================================================
 
 @dp.message(F.text == "⚙️ Settings")
 async def settings_handler(
@@ -2498,9 +2744,7 @@ Come back tomorrow or upgrade to Premium! 🚀
         # Title
         # ----------------------------------------------------
 
-        title = await get_video_title(
-            url
-        )
+        title = await get_video_title(url)
 
         if not title:
             title = "Untitled Video"
@@ -2509,19 +2753,13 @@ Come back tomorrow or upgrade to Premium! 🚀
         # Subtitles
         # ----------------------------------------------------
 
-        await bot.edit_message_text(
-            "📝 Getting English subtitles...",
-            status_msg.chat.id,
-            status_msg.message_id
-        )
+        await status_msg.edit_text("📝 Getting English subtitles...")
 
-        transcript = await get_subtitles(
-            url
-        )
+        transcript = await get_subtitles(url)
 
         if not transcript:
 
-            await bot.edit_message_text(
+            await status_msg.edit_text(
                 """
 ❌ Could not get English subtitles for this video.
 
@@ -2529,8 +2767,6 @@ The video may not have English subtitles or automatic English captions.
 
 Try another YouTube video.
 """,
-                status_msg.chat.id,
-                status_msg.message_id,
                 parse_mode="HTML"
             )
 
@@ -2544,21 +2780,13 @@ Try another YouTube video.
         # Cleaning
         # ----------------------------------------------------
 
-        await bot.edit_message_text(
-            "🧹 Cleaning transcript...",
-            status_msg.chat.id,
-            status_msg.message_id
-        )
+        await status_msg.edit_text("🧹 Cleaning transcript...")
 
         # ----------------------------------------------------
         # AI
         # ----------------------------------------------------
 
-        await bot.edit_message_text(
-            "🧠 Analyzing with AI...",
-            status_msg.chat.id,
-            status_msg.message_id
-        )
+        await status_msg.edit_text("🧠 Analyzing with AI...")
 
         analysis = await analyze_transcript(
             transcript,
@@ -2568,14 +2796,12 @@ Try another YouTube video.
 
         if not analysis:
 
-            await bot.edit_message_text(
+            await status_msg.edit_text(
                 """
 ❌ AI analysis failed.
 
 Please try again later.
 """,
-                status_msg.chat.id,
-                status_msg.message_id,
                 parse_mode="HTML"
             )
 
@@ -2585,11 +2811,7 @@ Please try again later.
         # Lesson
         # ----------------------------------------------------
 
-        await bot.edit_message_text(
-            "✨ Creating your lesson...",
-            status_msg.chat.id,
-            status_msg.message_id
-        )
+        await status_msg.edit_text("✨ Creating your lesson...")
 
         staged_candidates = stage_lesson_candidates(
             telegram_id,
@@ -2619,10 +2841,7 @@ Please try again later.
         # Delete processing message
         # ----------------------------------------------------
 
-        await bot.delete_message(
-            status_msg.chat.id,
-            status_msg.message_id
-        )
+        await status_msg.delete()
 
         # ----------------------------------------------------
         # Telegram message limit
@@ -2700,14 +2919,12 @@ Please try again later.
 
         try:
 
-            await bot.edit_message_text(
+            await status_msg.edit_text(
                 """
 ❌ An error occurred while processing the video.
 
 Please try again.
 """,
-                status_msg.chat.id,
-                status_msg.message_id,
                 parse_mode="HTML"
             )
 
@@ -3337,10 +3554,6 @@ async def exercise_choice_callback(
     UserState.practicing_word,
     F.data.startswith("feedback_")
 )
-@dp.callback_query(
-    UserState.practicing_word,
-    F.data.startswith("feedback_")
-)
 async def feedback_callback(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user is None:
         await callback.answer("❌ User data unavailable.", show_alert=True)
@@ -3490,7 +3703,7 @@ Keep learning! 💪
 
 
 # ============================================================
-# Catch-all Handler
+# AI Teacher
 # ============================================================
 
 @dp.message(F.text == "🤖 AI Teacher")
@@ -3560,6 +3773,10 @@ async def ai_teacher_message_handler(message: types.Message, state: FSMContext):
         await message.answer("I couldn't reach the AI teacher right now. Please try again shortly.")
 
 
+# ============================================================
+# Catch-all Handler
+# ============================================================
+
 @dp.message()
 async def echo_handler(
     message: types.Message,
@@ -3589,7 +3806,7 @@ Use the menu buttons or send a video URL.
 
 
 # ============================================================
-# Main
+# Background loops
 # ============================================================
 
 async def reminder_loop():
@@ -3641,6 +3858,28 @@ async def reminder_loop():
         await asyncio.sleep(30)
 
 
+async def premium_expiry_loop():
+    """End Premium access when the paid month is over and no renewal arrived."""
+    while True:
+        try:
+            for telegram_id in expire_premium_subscriptions():
+                try:
+                    await bot.send_message(
+                        telegram_id,
+                        "⭐ Your Premium subscription has ended.\n\n"
+                        "Renew anytime via ⭐ Premium in the main menu.",
+                    )
+                except Exception:
+                    logger.exception("Could not notify user %s about Premium expiry", telegram_id)
+        except Exception:
+            logger.exception("Premium expiry loop failed")
+        await asyncio.sleep(1800)
+
+
+# ============================================================
+# Main
+# ============================================================
+
 async def main():
 
     logger.info(
@@ -3649,12 +3888,14 @@ async def main():
 
     init_database()
     init_onboarding_storage()
+    init_premium_storage()
 
     logger.info(
         "Starting bot..."
     )
 
     reminder_task = asyncio.create_task(reminder_loop())
+    premium_task = asyncio.create_task(premium_expiry_loop())
 
     try:
 
@@ -3672,10 +3913,12 @@ async def main():
     finally:
 
         reminder_task.cancel()
-        try:
-            await reminder_task
-        except asyncio.CancelledError:
-            pass
+        premium_task.cancel()
+        for task in (reminder_task, premium_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
         await bot.session.close()
 
