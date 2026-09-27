@@ -10,8 +10,7 @@ from pathlib import Path
 from uuid import uuid4
 from datetime import date, datetime, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from typing import Optional, Dict, List, Any, cast
-
+from typing import Optional, Dict, List, Any, Tuple
 import yt_dlp
 
 from aiogram import Bot, Dispatcher, types, F
@@ -125,19 +124,19 @@ class UserState(StatesGroup):
 
 ONBOARDING_LEVELS = ("A1", "A2", "B1", "B2", "C1", "C2")
 ONBOARDING_GOALS = {
-    "Speaking": "Speaking",
-    "IELTS": "IELTS",
-    "General English": "General English",
-    "Business English": "Business English",
+    "🗣 Speaking": "Speaking",
+    "🎯 IELTS": "IELTS",
+    "📚 General English": "General English",
+    "💼 Business English": "Business English",
 }
 ONBOARDING_DIALECTS = {
     "🇺🇸 American English": "American",
     "🇬🇧 British English": "British",
 }
 ONBOARDING_PACES = {
-    "Relaxed": (10, 5),
-    "Regular": (20, 10),
-    "Intensive": (20, 10),
+    "🌱 Relaxed": (10, 5),
+    "⚡ Regular": (20, 10),
+    "🔥 Intensive": (20, 10),
 }
 
 
@@ -980,13 +979,15 @@ def build_practice_prompt(
     word: Dict[str, Any],
     exercise_type: str,
     vocabulary: List[Dict[str, Any]],
-) -> tuple[str, Optional[InlineKeyboardMarkup], Optional[int]]:
-    english = html.escape(str(word["word"]))
-    translation = html.escape(str(word["translation"]))
-    example = str(word.get("example") or "")
+) -> Tuple[str, Optional[InlineKeyboardMarkup], Optional[int]]:
+    english = html.escape(str(word.get("word", "")))
+    translation = html.escape(str(word.get("translation", "")))
+    example = html.escape(str(word.get("example") or ""))
+
 
     if exercise_type == "translation":
         return f"🇷🇺 Translate into English:\n\n<b>{translation}</b>", get_practice_keyboard(), None
+
     if exercise_type == "multiple_choice":
         distractors = [
             str(item["translation"])
@@ -994,16 +995,18 @@ def build_practice_prompt(
             if item.get("id") != word.get("id") and item.get("translation")
         ]
         options = list(dict.fromkeys([str(word["translation"]), *distractors]))[:4]
-        while len(options) < min(4, len(vocabulary)):
+        while len(options) < 4:
             options.append("I don't know")
         random.shuffle(options)
         correct_index = options.index(str(word["translation"]))
         text = f"What does <b>{english}</b> mean?"
         return text, get_multiple_choice_keyboard(options), correct_index
+
     if exercise_type == "fill_blank" and example:
         blanked = re.sub(re.escape(str(word["word"])), "______", example, count=1, flags=re.IGNORECASE)
         if blanked != example:
             return f"✍️ Fill in the blank:\n\n<i>{html.escape(blanked)}</i>", get_practice_keyboard(), None
+
     if exercise_type == "context" and example:
         return (
             f"🗣 What does <b>{english}</b> mean in this sentence?\n\n"
@@ -1011,28 +1014,17 @@ def build_practice_prompt(
             get_practice_keyboard(),
             None,
         )
+
     return f"🧠 Recall the meaning:\n\n<b>{english}</b>", get_practice_keyboard(), None
 
 
-def get_practice_feedback_keyboard(
-    word_id: int
-) -> InlineKeyboardMarkup:
-
+def get_practice_feedback_keyboard(word_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(
-                    text="❌ Again",
-                    callback_data=f"feedback_again_{word_id}",
-                ),
-                InlineKeyboardButton(
-                    text="🟡 Hard",
-                    callback_data=f"feedback_hard_{word_id}",
-                ),
-                InlineKeyboardButton(
-                    text="🟢 Easy",
-                    callback_data=f"feedback_easy_{word_id}",
-                ),
+                InlineKeyboardButton(text="❌ Again", callback_data=f"feedback_again_{word_id}"),
+                InlineKeyboardButton(text="🟡 Hard", callback_data=f"feedback_hard_{word_id}"),
+                InlineKeyboardButton(text="🟢 Easy", callback_data=f"feedback_easy_{word_id}"),
             ]
         ]
     )
@@ -1908,56 +1900,158 @@ async def history_callback(callback: types.CallbackQuery):
     )
     await callback.answer()
 
-
 @dp.message(F.text == "📊 Progress")
 async def progress_handler(
     message: types.Message
 ):
-
     if message.from_user is None:
         return
 
     telegram_id = message.from_user.id
 
-    user = get_or_create_user(
-        telegram_id
-    )
+    user = get_or_create_user(telegram_id)
 
-    vocab_count = count_user_vocabulary(
-        telegram_id
-    )
+    vocab_count = count_user_vocabulary(telegram_id)
+    videos_count = count_all_videos(telegram_id)
 
-    videos_count = count_all_videos(
-        telegram_id
-    )
-
-    streak = get_current_streak(
-        telegram_id
-    )
-    stats = get_progress_stats(telegram_id)
+    streak = get_current_streak(telegram_id)
     longest_streak = get_longest_streak(telegram_id)
-    reviews_target = max(1, int(user["daily_review_target"]))
-    new_words_target = max(1, int(user["daily_new_word_target"]))
-    reviews_progress = min(100, round(stats["reviews_today"] * 100 / reviews_target))
-    new_words_progress = min(100, round(stats["new_words_today"] * 100 / new_words_target))
-    weekly_start = get_user_local_date(telegram_id) - timedelta(days=6)
-    weekly_activity = stats["weekly_activity"]
-    max_activity = max(weekly_activity.values(), default=0)
-    activity_bars = ("▁", "▂", "▃", "▄", "▅", "▆", "▇", "█")
-    week_chart = "  ".join(
-        f"{(weekly_start + timedelta(days=offset)).strftime('%a')} "
-        f"{activity_bars[min(7, round(weekly_activity.get((weekly_start + timedelta(days=offset)).isoformat(), 0) * 7 / max(1, max_activity)))]}"
-        for offset in range(7)
+
+    stats = get_progress_stats(telegram_id)
+
+    reviews_target = max(
+        1,
+        int(user["daily_review_target"])
     )
-    new_words_bar = "█" * round(new_words_progress / 10) + "░" * (10 - round(new_words_progress / 10))
-    reviews_bar = "█" * round(reviews_progress / 10) + "░" * (10 - round(reviews_progress / 10))
+
+    new_words_target = max(
+        1,
+        int(user["daily_new_word_target"])
+    )
+
+    reviews_progress = min(
+        100,
+        round(
+            stats["reviews_today"] * 100 / reviews_target
+        )
+    )
+
+    new_words_progress = min(
+        100,
+        round(
+            stats["new_words_today"] * 100 / new_words_target
+        )
+    )
+
+    # =========================
+    # LAST 7 DAYS
+    # =========================
+
+    weekly_start = (
+        get_user_local_date(telegram_id)
+        - timedelta(days=6)
+    )
+
+    weekly_activity = stats["weekly_activity"]
+
+    week_values = []
+
+    for offset in range(7):
+        current_day = (
+            weekly_start
+            + timedelta(days=offset)
+        )
+
+        day_key = current_day.isoformat()
+
+        value = int(
+            weekly_activity.get(day_key, 0)
+        )
+
+        week_values.append(value)
+
+    max_activity = max(
+        week_values,
+        default=0
+    )
+
+    week_chart_lines = []
+
+    for offset, value in enumerate(week_values):
+        current_day = (
+            weekly_start
+            + timedelta(days=offset)
+        )
+
+        day_name = current_day.strftime("%a")
+
+        if max_activity > 0 and value > 0:
+            bar_length = max(
+                1,
+                round(
+                    value / max_activity * 10
+                )
+            )
+        else:
+            bar_length = 0
+
+        bar = "█" * bar_length
+
+        if not bar:
+            bar = "—"
+
+        week_chart_lines.append(
+            f"{day_name:<3} {bar:<10} {value}"
+        )
+
+    week_chart = "\n".join(
+        week_chart_lines
+    )
+
+    # =========================
+    # TODAY'S TARGET BARS
+    # =========================
+
+    new_words_filled = round(
+        new_words_progress / 10
+    )
+
+    reviews_filled = round(
+        reviews_progress / 10
+    )
+
+    new_words_bar = (
+        "█" * new_words_filled
+        + "░" * (10 - new_words_filled)
+    )
+
+    reviews_bar = (
+        "█" * reviews_filled
+        + "░" * (10 - reviews_filled)
+    )
+
+    # =========================
+    # PROGRESS MESSAGE
+    # =========================
+
+    daily_goal_completed = (
+        stats["new_words_today"] >= new_words_target
+        and
+        stats["reviews_today"] >= reviews_target
+    )
+
+    goal_message = (
+        "\n🔥 <b>Daily goal completed!</b>"
+        if daily_goal_completed
+        else ""
+    )
 
     progress_text = f"""
 📊 <b>Learning at a glance</b>
 
 {html.escape(str(user["level"]))} · {html.escape(str(user["learning_goal"]))}
 
-🔥 <b>{streak}</b> day streak · personal best {longest_streak}
+🔥 <b>{streak}</b> day streak · personal best <b>{longest_streak}</b>
 📚 {vocab_count} words · 🧠 {stats["mastered"]} mastered · 🎬 {videos_count} lessons
 🎯 {stats["accuracy"]}% review accuracy · {stats["due"]} due now
 
@@ -1967,16 +2061,14 @@ Reviews    {stats["reviews_today"]}/{reviews_target}  <code>{reviews_bar}</code>
 
 <b>Last 7 days</b>
 <code>{week_chart}</code>
-
-{"🔥 Daily goal completed!" if stats["new_words_today"] >= new_words_target and stats["reviews_today"] >= reviews_target else ""}
+{goal_message}
 """
 
     await message.answer(
         progress_text,
         parse_mode="HTML"
     )
-
-
+    
 @dp.message(F.text == "🔥 Streak")
 async def streak_handler(message: types.Message):
     if message.from_user is None:
@@ -2084,6 +2176,39 @@ async def premium_pre_checkout(query: types.PreCheckoutQuery):
 async def premium_successful_payment(message: types.Message):
     if message.from_user is None or message.successful_payment is None:
         return
+
+    payment = message.successful_payment
+    try:
+        result = record_premium_payment(
+            telegram_id=message.from_user.id,
+            payload=payment.invoice_payload,
+            currency=payment.currency,
+            total_amount=payment.total_amount,
+            telegram_charge_id=payment.telegram_payment_charge_id,
+            provider_charge_id=payment.provider_payment_charge_id,
+        )
+        if result == "activated":
+            await message.answer(
+                "⭐ <b>Premium activated!</b> Your account now has Premium access.",
+                parse_mode="HTML",
+                reply_markup=get_main_menu_keyboard(),
+            )
+        elif result == "duplicate":
+            await message.answer("This payment was already processed. Premium access remains active.")
+        else:
+            logger.error(
+                "Could not activate Premium after payment from user %s (result=%s)",
+                message.from_user.id,
+                result,
+            )
+            await message.answer(
+                "We couldn't verify this payment automatically. Please contact the bot owner with your Telegram payment receipt."
+            )
+    except Exception as e:
+        logger.exception("Error processing premium payment: %s", e)
+        await message.answer(
+            "An error occurred while processing your payment. Please contact support."
+        )
 
     payment = message.successful_payment
     result = record_premium_payment(
@@ -3212,11 +3337,11 @@ async def exercise_choice_callback(
     UserState.practicing_word,
     F.data.startswith("feedback_")
 )
-async def feedback_callback(
-    callback: types.CallbackQuery,
-    state: FSMContext
-):
-
+@dp.callback_query(
+    UserState.practicing_word,
+    F.data.startswith("feedback_")
+)
+async def feedback_callback(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user is None:
         await callback.answer("❌ User data unavailable.", show_alert=True)
         return
@@ -3226,12 +3351,13 @@ async def feedback_callback(
         return
 
     telegram_id = callback.from_user.id
-
     action_parts = callback.data.split("_")
 
-    difficulty = action_parts[1]
+    if len(action_parts) < 3:
+        await callback.answer("Invalid practice action.", show_alert=True)
+        return
 
-    session_saved = False
+    difficulty = action_parts[1]
     try:
         word_id = int(action_parts[2])
     except (IndexError, ValueError):
@@ -3248,19 +3374,11 @@ async def feedback_callback(
         await callback.answer("This answer was already recorded.", show_alert=True)
         return
 
-    # --------------------------------------------------------
     # Save practice session
-    # --------------------------------------------------------
-
-    conn = sqlite3.connect(
-        config.DB_PATH
-    )
-
-    cursor = conn.cursor()
-
+    session_saved = False
+    conn = sqlite3.connect(config.DB_PATH)
     try:
-
-        cursor.execute(
+        conn.execute(
             """
             INSERT INTO practice_sessions
             (telegram_id, word_id, difficulty, exercise_type, is_correct, callback_id)
@@ -3271,29 +3389,17 @@ async def feedback_callback(
                 word_id,
                 difficulty,
                 data.get("practice_type", "meaning"),
-                int(
-                    data["practice_is_correct"]
-                    if data.get("practice_is_correct") is not None
-                    else difficulty != "again"
-                ),
+                int(data.get("practice_is_correct", difficulty != "again")),
                 callback.id,
             )
         )
-
         conn.commit()
         session_saved = True
-
     except sqlite3.IntegrityError:
         logger.info("Duplicate practice callback ignored: %s", callback.id)
-
     except Exception as e:
-
-        logger.error(
-            f"Error saving practice session: {e}"
-        )
-
+        logger.error(f"Error saving practice session: {e}")
     finally:
-
         conn.close()
 
     if not session_saved:
@@ -3302,28 +3408,12 @@ async def feedback_callback(
 
     schedule_word_review(telegram_id, word_id, difficulty)
 
-    # --------------------------------------------------------
     # Next word
-    # --------------------------------------------------------
-
-    practice_words = data.get(
-        "practice_words",
-        []
-    )
-
-    practice_index = data.get(
-        "practice_index",
-        0
-    )
-
-    practice_index += 1
+    practice_words = data.get("practice_words", [])
+    practice_index = data.get("practice_index", 0) + 1
 
     if practice_index < len(practice_words):
-
-        next_word = practice_words[
-            practice_index
-        ]
-
+        next_word = practice_words[practice_index]
         exercise_types = ["meaning", "translation", "multiple_choice", "fill_blank", "context"]
         practice_mode = data.get("practice_mode", "free")
         exercise_type = (
@@ -3350,33 +3440,29 @@ async def feedback_callback(
             practice_is_correct=None,
         )
 
+        if not isinstance(callback.message, types.Message):
+            await callback.answer()
+            return
+
         try:
-
-            if not isinstance(callback.message, types.Message):
-                await callback.answer()
-                return
-
             await callback.message.edit_text(
                 practice_text,
                 parse_mode="HTML",
                 reply_markup=keyboard
             )
-
         except Exception as e:
-
-            logger.error(
-                f"Error editing message: {e}"
-            )
+            logger.error(f"Error editing message: {e}")
 
         await callback.answer()
-
     else:
-
         if not isinstance(callback.message, types.Message):
             await callback.answer()
             return
 
-        await callback.message.delete()
+        try:
+            await callback.message.delete()
+        except Exception as e:
+            logger.error(f"Error deleting message: {e}")
 
         await callback.message.answer(
             f"""
@@ -3390,11 +3476,10 @@ Keep learning! 💪
             reply_markup=get_main_menu_keyboard()
         )
 
-        await state.set_state(
-            UserState.choosing_action
-        )
+        await state.set_state(UserState.choosing_action)
         await state.update_data(practice_current_word=None)
 
+    # Check streak milestone
     current_streak = get_current_streak(telegram_id)
     if save_streak_milestone(telegram_id, current_streak):
         if isinstance(callback.message, types.Message):
@@ -3402,8 +3487,6 @@ Keep learning! 💪
                 f"🏆 <b>{current_streak}-day streak!</b> Keep the momentum going.",
                 parse_mode="HTML",
             )
-
-        await callback.answer()
 
 
 # ============================================================
@@ -3420,12 +3503,16 @@ async def ai_teacher_start_handler(message: types.Message, state: FSMContext):
 
 
 @dp.message(UserState.ai_teacher_chat)
-async def ai_teacher_message_handler(message: types.Message):
+async def ai_teacher_message_handler(message: types.Message, state: FSMContext):
     if message.from_user is None or not message.text:
         return
+
     if message.text.strip() == "/start":
+        await state.clear()
         await message.answer("AI Teacher closed.", reply_markup=get_main_menu_keyboard())
+        await state.set_state(UserState.choosing_action)
         return
+
     if not config.OPENAI_API_KEY:
         await message.answer("AI Teacher is unavailable because OPENAI_API_KEY is not configured.")
         return
@@ -3447,6 +3534,7 @@ async def ai_teacher_message_handler(message: types.Message):
         ],
         "recent_lessons": [video["title"] for video in recent_videos],
     }
+
     try:
         response = await openai_client.chat.completions.create(
             model="gpt-3.5-turbo",
@@ -3467,8 +3555,8 @@ async def ai_teacher_message_handler(message: types.Message):
         )
         answer = response.choices[0].message.content or "I couldn't form an answer. Please try rephrasing."
         await message.answer(answer[:4000])
-    except Exception:
-        logger.exception("AI Teacher request failed")
+    except Exception as e:
+        logger.exception("AI Teacher request failed: %s", e)
         await message.answer("I couldn't reach the AI teacher right now. Please try again shortly.")
 
 
@@ -3609,4 +3697,3 @@ if __name__ == "__main__":
         logger.info(
             "Bot stopped by user"
         )
-
